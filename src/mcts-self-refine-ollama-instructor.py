@@ -130,7 +130,7 @@ class MCTS:
         return list(reversed(path))
 
     def save_mermaid_markdown(self, mermaid_content: str, root_state: str, best_answer: str, best_node_id: int):
-        filename = "mcts_tree_visualization.md"
+        filename = "./output/mcts_tree_visualization.md"
         with open(filename, "w") as f:
             f.write("# MCTS Tree Visualization\n\n")
             f.write(f"Initial question: {root_state}\n\n")
