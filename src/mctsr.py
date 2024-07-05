@@ -1,6 +1,6 @@
 import math
 import re
-from typing import List, Dict, Tuple, Any, Optional, Type
+from typing import List, Dict, Tuple, Any, Optional, Type, Union
 from functools import lru_cache
 import asyncio
 import instructor
@@ -9,10 +9,27 @@ import time
 import ollama
 import numpy as np
 from scipy.spatial.distance import cosine
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 LLM_MODEL = 'gemma2'
 EMBEDDING_MODEL = 'mxbai-embed-large'
+
+class NumericAnswer(BaseModel):
+    value: float = Field(..., description="The numeric answer")
+
+class TextAnswer(BaseModel):
+    text: str = Field(..., description="The text answer")
+
+class ChoiceAnswer(BaseModel):
+    choice: str = Field(..., description="The selected choice (A, B, C, or D)")
+
+class YesNoAnswer(BaseModel):
+    answer: bool = Field(..., description="True for Yes, False for No")
+
+class FormulaAnswer(BaseModel):
+    formula: str = Field(..., description="The mathematical formula")
+
+AnswerType = Union[NumericAnswer, TextAnswer, ChoiceAnswer, YesNoAnswer, FormulaAnswer]
 
 class DetailedCritique(BaseModel):
     flaws: List[str] = Field(..., description="List of identified flaws and areas for improvement")
@@ -29,7 +46,7 @@ class StructuredFeedback(BaseModel):
 class RefinedAnswer(BaseModel):
     reasoning_process: str = Field(..., description="Explanation of the updated thought process")
     verification: str = Field(..., description="Confirmation that all feedback points have been addressed")
-    final_answer: str = Field(..., description="The refined and improved answer")
+    final_answer: AnswerType = Field(..., description="The refined and improved answer")
 
 class WeakHints(BaseModel):
     major_flaws: List[str] = Field(..., description="Major flaws in reasoning")
@@ -42,7 +59,12 @@ class BetterAnswer(BaseModel):
     reasoning_process: str = Field(..., description="Explanation of the thought process")
     feedback_addressing: str = Field(..., description="Description of how the feedback is being addressed")
     verification: str = Field(..., description="Double-check of the refined answer")
-    final_answer: str = Field(..., description="The refined answer")
+    final_answer: AnswerType = Field(..., description="The refined answer")
+
+class WeakAnswer(BaseModel):
+    reasoning_process: str = Field(..., description="Explanation of the reasoning process")
+    verification: str = Field(..., description="Verification of the answer")
+    final_answer: AnswerType = Field(..., description="The final answer to the question")
 
 class LLM:
     def __init__(self, model=LLM_MODEL):
@@ -141,37 +163,22 @@ def extract_label(text: str, type: str = '') -> Optional[str]:
         sentences = text.split('.')
         return sentences[-1].strip() if sentences else None
 
-def check(gt: str, ans: str, answer_type: str = 'text', tolerance: float = 1e-6) -> bool:
-    gt = gt.strip()
-    ans = ans.strip()
-
-    if answer_type == 'numeric':
-        return check_numeric(gt, ans, tolerance)
-    elif answer_type == 'choice':
-        return check_choice(gt, ans)
-    elif answer_type == 'yesno':
-        return check_yesno(gt, ans)
-    elif answer_type == 'formula':
-        return check_formula(gt, ans)
-    else:  # 'text' or その他
-        return check_text(gt, ans)
-
-def check_numeric(gt: str, ans: str, tolerance: float) -> bool:
-    try:
-        gt_value = float(gt)
-        ans_value = float(ans)
-        return math.isclose(gt_value, ans_value, rel_tol=tolerance)
-    except ValueError:
+def check(gt: AnswerType, ans: AnswerType, tolerance: float = 1e-6) -> bool:
+    if type(gt) != type(ans):
         return False
 
-def check_choice(gt: str, ans: str) -> bool:
-    return gt.lower() == ans.lower()
-
-def check_yesno(gt: str, ans: str) -> bool:
-    return gt.lower() == ans.lower()
-
-def check_formula(gt: str, ans: str) -> bool:
-    return gt.replace(' ', '') == ans.replace(' ', '')
+    if isinstance(gt, NumericAnswer):
+        return math.isclose(gt.value, ans.value, rel_tol=tolerance)
+    elif isinstance(gt, TextAnswer):
+        return check_text(gt.text, ans.text)
+    elif isinstance(gt, ChoiceAnswer):
+        return gt.choice.upper() == ans.choice.upper()
+    elif isinstance(gt, YesNoAnswer):
+        return gt.answer == ans.answer
+    elif isinstance(gt, FormulaAnswer):
+        return gt.formula.replace(' ', '') == ans.formula.replace(' ', '')
+    else:
+        raise ValueError(f"Unsupported answer type: {type(gt)}")
 
 def get_embedding(text: str) -> List[float]:
     """
@@ -216,13 +223,12 @@ def check_text(gt: str, ans: str, similarity_threshold: float = 0.8) -> bool:
     # 類似度が閾値以上ならTrueを返す
     return similarity >= similarity_threshold
 
-# MCTSrの主要クラス
 class MCTSr:
-    def __init__(self, query: str, ground_truth: str, max_iter: int = 16, ans_format: str = ''):
+    def __init__(self, query: str, ground_truth: AnswerType, max_iter: int = 16, answer_type: Type[AnswerType] = TextAnswer):
         self.query = query
         self.ground_truth = ground_truth
         self.max_iter = max_iter
-        self.ans_format = ans_format
+        self.answer_type = answer_type
         
         self.to_explore: List[str] = []
         self.to_explore_reward: Dict[str, List[float]] = {}
@@ -233,21 +239,21 @@ class MCTSr:
         self.childs: Dict[str, List[str]] = {}
         self.hints_reward_imp_bank: Dict[str, List[Tuple[str, float, str]]] = {}
 
-        # 改善点5: 終了条件の拡張
-        self.early_stop_threshold = 0.01  # 改善率の閾値
-        self.max_depth = 10  # 最大探索深度
-        self.logits_threshold = 0.95  # 言語モデルのロジットに基づく閾値
+        self.early_stop_threshold = 0.01
+        self.max_depth = 10
+        self.logits_threshold = 0.95
 
-    async def sampling_reward(self, answer: str) -> None:
-        if answer not in self.to_explore_reward:
-            self.to_explore_reward[answer] = []
+    async def sampling_reward(self, answer: AnswerType) -> None:
+        answer_str = str(answer.model_dump())
+        if answer_str not in self.to_explore_reward:
+            self.to_explore_reward[answer_str] = []
         reward = await self.cal_reward(self.query, answer)
-        self.to_explore_reward[answer].append(reward)
+        self.to_explore_reward[answer_str].append(reward)
 
-    async def cal_reward(self, question: str, ans: str) -> float:
+    async def cal_reward(self, question: str, ans: AnswerType) -> float:
         prompt = f"""
         Question: {question}
-        Answer: {ans}
+        Answer: {ans.model_dump_json()}
         
         Task:
         1. Analyze this answer rigorously and critically.
@@ -260,28 +266,30 @@ class MCTSr:
         response, _ = await generate(prompt, response_model=DetailedCritique)
         
         score = response.score
-        print(f'{score=}')
         if score > 95:
             score = 95 + (score - 95) * 0.1
         return score
 
-    def add_to_hints_bank(self, hints: WeakHints, weak_answer: str) -> None:
-        if weak_answer not in self.hints_bank:
-            self.hints_bank[weak_answer] = []
-        self.hints_bank[weak_answer].append(hints.model_dump_json())
+    def add_to_hints_bank(self, hints: WeakHints, weak_answer: AnswerType) -> None:
+        weak_answer_str = str(weak_answer.model_dump())
+        if weak_answer_str not in self.hints_bank:
+            self.hints_bank[weak_answer_str] = []
+        self.hints_bank[weak_answer_str].append(hints.model_dump_json())
 
-    def add_to_childs(self, father: str, child: str) -> None:
-        if father not in self.childs:
-            self.childs[father] = []
-        self.childs[father].append(child)
+    def add_to_childs(self, father: AnswerType, child: AnswerType) -> None:
+        father_str = str(father.model_dump())
+        child_str = str(child.model_dump())
+        if father_str not in self.childs:
+            self.childs[father_str] = []
+        self.childs[father_str].append(child_str)
 
-    def add_to_hints_reward_imp_bank(self, hints: WeakHints, weak_answer: str, reward: float, answer: str) -> None:
-        if weak_answer not in self.hints_reward_imp_bank:
-            self.hints_reward_imp_bank[weak_answer] = []
-        self.hints_reward_imp_bank[weak_answer].append((hints.model_dump_json(), reward, answer))
+    def add_to_hints_reward_imp_bank(self, hints: WeakHints, weak_answer: AnswerType, reward: float, answer: AnswerType) -> None:
+        weak_answer_str = str(weak_answer.model_dump())
+        if weak_answer_str not in self.hints_reward_imp_bank:
+            self.hints_reward_imp_bank[weak_answer_str] = []
+        self.hints_reward_imp_bank[weak_answer_str].append((hints.model_dump_json(), reward, str(answer.model_dump())))
 
     def filter_mature_node(self, max_expand: int = 3) -> List[str]:
-        # 改善点7: 候補ノードの選択の改善
         filterd_to_explore = []
         avg_reward = self.calculate_avg_reward()
 
@@ -306,8 +314,8 @@ class MCTSr:
         return r_c + C * math.sqrt(math.log(N_n + 1) / (N_c + epsilon))
 
     def update_ucb(self, C: float = 1.4) -> None:
-        # 改善点8: 探索と活用のバランスの調整
         visit_count = {node: len(rewards) for node, rewards in self.to_explore_reward.items()}
+        total_visits = sum(visit_count.values())
         avg_reward = self.calculate_avg_reward()
 
         leaves = set(self.to_explore) - set(self.fathers.values())
@@ -315,8 +323,8 @@ class MCTSr:
         for leaf in leaves:
             self.ucb_bank[leaf] = self.compute_ucb(
                 avg_reward[leaf],
-                len(self.to_explore_reward.get(self.fathers.get(leaf, None), [])),
-                len(self.to_explore_reward.get(leaf, [])),
+                total_visits,
+                visit_count[leaf],
                 C=C * (1 + math.log(len(self.to_explore) + 1) / 10)  # Cを動的に調整
             )
         
@@ -333,28 +341,26 @@ class MCTSr:
                         father_reward = (avg_reward[father] + child_reward) / 2
                         self.ucb_bank[father] = self.compute_ucb(
                             father_reward,
-                            len(self.to_explore_reward.get(self.fathers.get(father, None), [])),
-                            len(self.to_explore_reward.get(father, [])),
+                            total_visits,
+                            visit_count[father],
                             C=C * (1 + math.log(len(self.to_explore) + 1) / 10)  # Cを動的に調整
                         )
             nodes_to_update = list(new_nodes_to_update)
 
-    async def step(self, weak_answer: str) -> Tuple[WeakHints, BetterAnswer, List[str]]:
-        # 改善点6: 自己改善プロセスの強化
-        history_list = list(self.history_bank[weak_answer])
+    async def step(self, weak_answer: AnswerType) -> Tuple[WeakHints, BetterAnswer, List[str]]:
+        history_list = list(self.history_bank[str(weak_answer.model_dump())])
         hints, history = await self.get_weak_hints(self.query, weak_answer, history=history_list)
         better_answer, history = await self.get_better_answer(self.query, weak_answer, hints, history=history)
         
-        # 構造化されたフィードバックの活用
         structured_feedback = await self.generate_structured_feedback(hints, better_answer.final_answer)
         improved_answer, history = await self.refine_answer_with_feedback(self.query, better_answer.final_answer, structured_feedback, history=history)
         
         return hints, improved_answer, history
 
-    async def get_weak_hints(self, question: str, weak_answer: str, history: List[str] = []) -> Tuple[WeakHints, List[str]]:
+    async def get_weak_hints(self, question: str, weak_answer: AnswerType, history: List[str] = []) -> Tuple[WeakHints, List[str]]:
         query = f"""
         Question: {question}
-        Weak Answer: {weak_answer}
+        Weak Answer: {weak_answer.model_dump_json()}
 
         Task:
         1. Analyze the weak answer critically and thoroughly.
@@ -367,33 +373,25 @@ class MCTSr:
         response, updated_history = await generate(query, response_model=WeakHints, history=history)
         return response, updated_history
 
-    async def get_better_answer(self, question: str, weak_answer: str, hint: WeakHints, history: List[str] = []) -> Tuple[BetterAnswer, List[str]]:
+    async def get_better_answer(self, question: str, weak_answer: AnswerType, hint: WeakHints, history: List[str] = []) -> Tuple[BetterAnswer, List[str]]:
         query = f"""
         Question: {question}
-        Previous Answer: {weak_answer}
+        Previous Answer: {weak_answer.model_dump_json()}
         Feedback: {hint.model_dump_json()}
 
         Task:
-        Refine the previous answer according to the provided feedback. Your response should follow the structure defined in the BetterAnswer model, which includes:
-        1. reasoning_process: Explanation of your updated thought process
-        2. feedback_addressing: Specific description of how you're addressing each point of feedback
-        3. verification: A double-check of your refined answer
-        4. final_answer: The refined and improved answer
+        Refine the previous answer according to the provided feedback. Your response should follow the structure defined in the BetterAnswer model.
+        The final_answer should be of type {self.answer_type.__name__}.
 
         Remember to think through each step carefully as you refine your response.
         """
-        try:
-            response, updated_history = await generate(query, response_model=BetterAnswer, history=history)
-        except ValidationError as e:
-            print(f"Validation error: {e}")
-            # Implement fallback logic or retry mechanism here
-            # For example, you could try to extract partial information or request a new response
+        response, updated_history = await generate(query, response_model=BetterAnswer, history=history)
         return response, updated_history
 
-    async def generate_structured_feedback(self, hints: WeakHints, answer: str) -> StructuredFeedback:
+    async def generate_structured_feedback(self, hints: WeakHints, answer: AnswerType) -> StructuredFeedback:
         query = f"""
         Original Hints: {hints.model_dump_json()}
-        Current Answer: {answer}
+        Current Answer: {answer.model_dump_json()}
 
         Task:
         Based on the original hints and the current answer, generate structured feedback.
@@ -401,96 +399,124 @@ class MCTSr:
         feedback, _ = await generate(query, response_model=StructuredFeedback)
         return feedback
 
-    async def refine_answer_with_feedback(self, question: str, answer: str, structured_feedback: StructuredFeedback, history: List[str] = []) -> Tuple[RefinedAnswer, List[str]]:
+    async def refine_answer_with_feedback(self, question: str, answer: AnswerType, structured_feedback: StructuredFeedback, history: List[str] = []) -> Tuple[RefinedAnswer, List[str]]:
         query = f"""
         Question: {question}
-        Current Answer: {answer}
+        Current Answer: {answer.model_dump_json()}
         Structured Feedback:
         {structured_feedback.model_dump_json(indent=2)}
 
         Task:
         Refine the current answer based on the structured feedback provided.
+        The final_answer should be of type {self.answer_type.__name__}.
         """
         return await generate(query, response_model=RefinedAnswer, history=history)
 
+    async def get_weak_answer(self) -> Tuple[WeakAnswer, List[str]]:
+        query = f"""
+        Question: {self.query}
+        
+        Task:
+        Provide an initial answer to the question. Your response should follow this structure:
+        1. [Reasoning Process]: Explain your thought process
+        2. [Verification]: Double-check your answer
+        3. [Final Answer]: Provide your answer in the format specified by {self.answer_type.__name__}
+
+        Think through each step carefully.
+        """
+        response, history = await generate(query, response_model=WeakAnswer, timeout=90)
+        return response, history
+
     async def main_loop(self) -> Tuple[List[WeakHints], List[RefinedAnswer], List[str], Dict[str, List[float]], Dict[str, List[str]], Dict[str, Tuple[str, ...]], Dict[str, List[Tuple[str, float, str]]], Dict[str, str], Dict[str, List[str]], Dict[str, float]]:
         weak_answer, history = await self.get_weak_answer()
-        self.history_bank[weak_answer] = tuple(history)
-        self.to_explore = [weak_answer]
-        self.childs[weak_answer] = []
-        self.fathers[weak_answer] = None
-        await self.sampling_reward(weak_answer)
+        self.history_bank[str(weak_answer.final_answer.model_dump())] = tuple(history)
+        self.to_explore = [str(weak_answer.final_answer.model_dump())]
+        self.childs[str(weak_answer.final_answer.model_dump())] = []
+        self.fathers[str(weak_answer.final_answer.model_dump())] = None
+        await self.sampling_reward(weak_answer.final_answer)
 
         hints_list = []
-        answers_list = [RefinedAnswer(reasoning_process="Initial answer", verification="No verification", final_answer=weak_answer)]
+        answers_list = [RefinedAnswer(
+            reasoning_process=weak_answer.reasoning_process,
+            verification=weak_answer.verification,
+            final_answer=weak_answer.final_answer
+        )]
 
         self.update_ucb()
 
         for iteration in range(self.max_iter):
             filtered_to_explore = self.filter_mature_node()
-            weak_answer = self.get_best_explore_from_ucb(filtered_to_explore)
+            weak_answer_str = self.get_best_explore_from_ucb(filtered_to_explore)
+            weak_answer = self.answer_type(**eval(weak_answer_str))
             await self.sampling_reward(weak_answer)
 
             hints, refined_answer, history = await self.step(weak_answer)
             self.add_to_hints_bank(hints, weak_answer)
-            self.history_bank[refined_answer.final_answer] = tuple(history)
-            self.to_explore.append(refined_answer.final_answer)
+            self.history_bank[str(refined_answer.final_answer.model_dump())] = tuple(history)
+            self.to_explore.append(str(refined_answer.final_answer.model_dump()))
             await self.sampling_reward(refined_answer.final_answer)
-            self.fathers[refined_answer.final_answer] = weak_answer
-            self.childs[refined_answer.final_answer] = []
+            self.fathers[str(refined_answer.final_answer.model_dump())] = str(weak_answer.model_dump())
+            self.childs[str(refined_answer.final_answer.model_dump())] = []
             self.add_to_childs(weak_answer, refined_answer.final_answer)
             answers_list.append(refined_answer)
             hints_list.append(hints)
 
-            # 改善点5: 終了条件の拡張
             if self.check_termination(refined_answer.final_answer, iteration):
                 break
 
             self.update_ucb()
-            self.add_to_hints_reward_imp_bank(hints, weak_answer, min(self.to_explore_reward.get(refined_answer.final_answer, [])) - min(self.to_explore_reward.get(weak_answer, [])), refined_answer.final_answer)
+            self.add_to_hints_reward_imp_bank(
+                hints,
+                weak_answer,
+                min(self.to_explore_reward.get(str(refined_answer.final_answer.model_dump()), [])) - 
+                min(self.to_explore_reward.get(str(weak_answer.model_dump()), [])),
+                refined_answer.final_answer
+            )
 
         return hints_list, answers_list, self.to_explore, self.to_explore_reward, self.hints_bank, self.history_bank, self.hints_reward_imp_bank, self.fathers, self.childs, self.ucb_bank
 
-    def check_termination(self, current_answer: str, iteration: int) -> bool:
-        # 正解チェック
+    def check_termination(self, current_answer: AnswerType, iteration: int) -> bool:
         if check(self.ground_truth, current_answer):
             return True
 
-        # 早期停止
         if iteration > 1:
-            current_reward = self.to_explore_reward[current_answer][-1]
-            previous_reward = self.to_explore_reward[self.fathers[current_answer]][-1]
+            current_reward = self.to_explore_reward[str(current_answer.model_dump())][-1]
+            previous_reward = self.to_explore_reward[self.fathers[str(current_answer.model_dump())]][-1]
             if (current_reward - previous_reward) / abs(previous_reward) < self.early_stop_threshold:
                 return True
 
-        # 探索深度制限
         if len(self.fathers) > self.max_depth:
             return True
 
-        # 言語モデルのロジットに基づく終了条件
-        # 注: この部分は使用する言語モデルの仕様に応じて調整が必要です
-        # logits = self.get_logits(current_answer)
-        # if max(logits) > self.logits_threshold:
-        #     return True
-
         return False
 
-    async def get_weak_answer(self) -> Tuple[str, List[str]]:
-        query = f'Question: {self.query}\nThe response should begin with [reasoning process]...[Verification]... and end with {self.ans_format}\nLet\'s think step by step.'
-        return await generate(query, timeout=90)
-
-# メイン処理
 async def process_example(example: Dict[str, Any]) -> Dict[str, Any]:
     query = example['question']
     ground_truth = example['answer']
-    ans_format = '"[Final Answer] The answer is [answer] \n#### [answer]"'
+    answer_type = TextAnswer  # デフォルトはTextAnswer、必要に応じて変更
 
-    mctsr = MCTSr(query, ground_truth, max_iter=16, ans_format=ans_format)
+    if isinstance(ground_truth, (int, float)):
+        answer_type = NumericAnswer
+        ground_truth = NumericAnswer(value=float(ground_truth))
+    elif isinstance(ground_truth, bool):
+        answer_type = YesNoAnswer
+        ground_truth = YesNoAnswer(answer=ground_truth)
+    elif isinstance(ground_truth, str):
+        if ground_truth.upper() in ['A', 'B', 'C', 'D']:
+            answer_type = ChoiceAnswer
+            ground_truth = ChoiceAnswer(choice=ground_truth.upper())
+        elif '$' in ground_truth:  # 簡易的な数式判定
+            answer_type = FormulaAnswer
+            ground_truth = FormulaAnswer(formula=ground_truth.strip('$'))
+        else:
+            ground_truth = TextAnswer(text=ground_truth)
+
+    mctsr = MCTSr(query, ground_truth, max_iter=16, answer_type=answer_type)
     hints_list, answers_list, to_explore, to_explore_reward, hints_bank, history_bank, hints_reward_imp_bank, fathers, childs, ucb_bank = await mctsr.main_loop()
 
     return {
         'query': query,
-        'ground_truth': ground_truth,
+        'ground_truth': ground_truth.model_dump(),
         'hints_list': [hint.model_dump() for hint in hints_list],
         'answers_list': [answer.model_dump() for answer in answers_list],
         'to_explore': to_explore,
@@ -503,15 +529,13 @@ async def process_example(example: Dict[str, Any]) -> Dict[str, Any]:
         'ucb_bank': ucb_bank,
     }
 
-# メイン実行
 async def main():
-    # データセットの読み込みと処理
-    # dataset = load_dataset(...)
-    # この部分は実際のデータセットに合わせて調整する必要があります
     dataset = [
-        {"question": "2 + 2 = ?", "answer": "4"},
-        {"question": "What is the capital of France?", "answer": "Paris"},
-        # ... 他の例を追加 ...
+        {"question": "2 + 2 = ?", "answer": 4},
+        # {"question": "What is the capital of France?", "answer": "Paris"},
+        # {"question": "Is the Earth flat?", "answer": False},
+        # {"question": "Which of the following is a prime number? A) 4, B) 7, C) 9, D) 12", "answer": "B"},
+        # {"question": "What is the formula for the area of a circle?", "answer": "$πr^2$"},
     ]
     
     processed_data = []
@@ -519,7 +543,6 @@ async def main():
         result = await process_example(example)
         processed_data.append(result)
     
-    # 結果の保存（例：JSON形式で）
     import json
     with open('processed_data.json', 'w') as f:
         json.dump(processed_data, f, indent=4)
