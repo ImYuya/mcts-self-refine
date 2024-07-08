@@ -538,7 +538,7 @@ async def main():
         processed_data.append(result)
     
     import json
-    with open('processed_data.json', 'w') as f:
+    with open('./output/processed_data.json', 'w') as f:
         json.dump(processed_data, f, indent=4)
     
     print(f"処理が完了しました。{len(processed_data)}個の例が処理されました。")

@@ -43,6 +43,12 @@ MCTS-Self-Refine is a Python project that uses the Monte Carlo Tree Search (MCTS
 
    Note: Downloading the model may take some time, ranging from a few minutes to tens of minutes depending on your network speed.
 
+   For embedding, you can use 'mxbai-embed-large'.
+
+   ```
+   ollama pull mxbai-embed-large
+   ```
+
 ### Project Setup
 
 1. Clone the repository:
@@ -71,19 +77,14 @@ MCTS-Self-Refine is a Python project that uses the Monte Carlo Tree Search (MCTS
 2. Run the script:
 
    ```
-   rye run python src/mcts-self-refine-ollama-instructor.py
+   rye run python src/mctsr.py
    ```
 
 3. When prompted, enter your question.
 
 4. The MCTS algorithm will run and generate the optimal answer.
 
-5. The results will be displayed in the standard output, and the exploration tree visualization will be saved in the `mcts_tree_visualization.md` file in the `./output` folder.
-
-6. The output markdown file (`mcts_tree_visualization.md`) will contain:
-   - The initial question
-   - A Mermaid diagram representing the MCTS tree
-   - The best answer found by the algorithm
+5. The results will be displayed in the standard output, and the exploration tree visualization will be saved in the `processed_data.json` file in the `./output` folder.
 
    Example of the output:
 
@@ -143,7 +144,7 @@ MCTS-Self-Refine is a Python project that uses the Monte Carlo Tree Search (MCTS
 
 ## Customization
 
-- Adjust the parameters of the `MCTS` class in the `src/mcts-self-refine-ollama-instructor.py` file to change the depth of exploration or the number of iterations.
+- Adjust the parameters of the `MCTS` class in the `src/mctsr.py` file to change the depth of exploration or the number of iterations.
 - Modify the `model` parameter in the `LLM` class to use different LLM models.
 
 ## Troubleshooting
