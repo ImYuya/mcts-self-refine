@@ -233,10 +233,9 @@ class MCTSr:
         self.childs: Dict[str, List[str]] = {}
         self.hints_reward_imp_bank: Dict[str, List[Tuple[str, float, str]]] = {}
 
-        # 改善点5: 終了条件の拡張
-        self.early_stop_threshold = 0.01  # 改善率の閾値
-        self.max_depth = 10  # 最大探索深度
-        self.logits_threshold = 0.95  # 言語モデルのロジットに基づく閾値
+        self.early_stop_threshold = 0.01
+        self.max_depth = 10
+        self.logits_threshold = 0.95
 
     async def sampling_reward(self, answer: str) -> None:
         if answer not in self.to_explore_reward:
@@ -281,7 +280,6 @@ class MCTSr:
         self.hints_reward_imp_bank[weak_answer].append((hints.model_dump_json(), reward, answer))
 
     def filter_mature_node(self, max_expand: int = 3) -> List[str]:
-        # 改善点7: 候補ノードの選択の改善
         filterd_to_explore = []
         avg_reward = self.calculate_avg_reward()
 
@@ -296,56 +294,56 @@ class MCTSr:
         return filterd_to_explore
 
     def calculate_avg_reward(self) -> Dict[str, float]:
-        return {node: (min(rewards) + sum(rewards) / len(rewards)) / 2 for node, rewards in self.to_explore_reward.items()}
+        return {node: self.calculate_q_value(rewards) for node, rewards in self.to_explore_reward.items()}
+
+    def calculate_q_value(self, rewards: List[float]) -> float:
+        if not rewards:
+            return float('-inf')
+        return (min(rewards) + sum(rewards) / len(rewards)) / 2
 
     def get_best_explore_from_ucb(self, to_explore: List[str]) -> str:
         best_node = max(to_explore, key=lambda node: self.ucb_bank.get(node, float('-inf')))
         return best_node
 
-    def compute_ucb(self, r_c: float, N_n: int, N_c: int, C: float = 1.4, epsilon: float = 1e-5) -> float:
-        return r_c + C * math.sqrt(math.log(N_n + 1) / (N_c + epsilon))
+    def compute_ucb(self, q_value: float, N_p: int, N_c: int, C: float = 1.4, epsilon: float = 1e-5) -> float:
+        return q_value + C * math.sqrt(math.log(N_p + 1) / (N_c + epsilon))
 
     def update_ucb(self, C: float = 1.4) -> None:
         visit_count = {node: len(rewards) for node, rewards in self.to_explore_reward.items()}
-        total_visits = sum(visit_count.values())
-        avg_reward = self.calculate_avg_reward()
+        q_values = self.calculate_avg_reward()
 
-        leaves = set(self.to_explore) - set(self.fathers.values())
-        
-        for leaf in leaves:
-            self.ucb_bank[leaf] = self.compute_ucb(
-                avg_reward[leaf],
-                total_visits,
-                visit_count[leaf],
-                C=C * (1 + math.log(len(self.to_explore) + 1) / 10)  # Cを動的に調整
-            )
-        
-        nodes_to_update = list(leaves)
-        while nodes_to_update:
-            new_nodes_to_update = set()
-            for node in nodes_to_update:
-                father = self.fathers.get(node)
-                if father is not None:
-                    if father not in self.ucb_bank:
-                        new_nodes_to_update.add(father)
-                    if father in avg_reward:
-                        child_reward = max([avg_reward[child] for child in self.childs[father]])
-                        father_reward = (avg_reward[father] + child_reward) / 2
-                        self.ucb_bank[father] = self.compute_ucb(
-                            father_reward,
-                            total_visits,
-                            visit_count[father],
-                            C=C * (1 + math.log(len(self.to_explore) + 1) / 10)  # Cを動的に調整
-                        )
-            nodes_to_update = list(new_nodes_to_update)
+        def update_node_ucb(node: str) -> None:
+            if node not in self.fathers:  # ルートノード
+                self.ucb_bank[node] = q_values[node]
+            else:
+                parent = self.fathers[node]
+                self.ucb_bank[node] = self.compute_ucb(
+                    q_values[node],
+                    visit_count.get(parent, 0),
+                    visit_count[node],
+                    C=C * (1 + math.log(len(self.to_explore) + 1) / 10)
+                )
+
+        def backpropagate(node: str) -> None:
+            if node not in self.fathers:
+                return
+            parent = self.fathers[node]
+            if parent in q_values:
+                # 親ノードの現在の Q 値と子ノードの最大 Q 値の平均を計算
+                max_child_q = max(q_values[child] for child in self.children[parent])
+                q_values[parent] = 0.5 * (q_values[parent] + max_child_q)
+                update_node_ucb(parent)
+                backpropagate(parent)
+
+        for node in self.to_explore:
+            update_node_ucb(node)
+            backpropagate(node)
 
     async def step(self, weak_answer: str) -> Tuple[WeakHints, BetterAnswer, List[str]]:
-        # 改善点6: 自己改善プロセスの強化
         history_list = list(self.history_bank[weak_answer])
         hints, history = await self.get_weak_hints(self.query, weak_answer, history=history_list)
         better_answer, history = await self.get_better_answer(self.query, weak_answer, hints, history=history)
         
-        # 構造化されたフィードバックの活用
         structured_feedback = await self.generate_structured_feedback(hints, better_answer.final_answer)
         improved_answer, history = await self.refine_answer_with_feedback(self.query, better_answer.final_answer, structured_feedback, history=history)
         
@@ -364,8 +362,25 @@ class MCTSr:
 
         Your response should follow the structure defined in the WeakHints model.
         """
-        response, updated_history = await generate(query, response_model=WeakHints, history=history)
-        return response, updated_history
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response, updated_history = await generate(query, response_model=WeakHints, history=history)
+                return response, updated_history
+            except ValidationError as e:
+                print(f"Attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    print("All attempts failed. Returning default WeakHints.")
+                    return WeakHints(
+                        major_flaws=["Unable to generate valid hints"],
+                        factual_inaccuracies=["N/A"],
+                        structure_clarity="Unable to assess",
+                        depth_breadth="Unable to assess",
+                        missing_points=["Unable to identify missing points"]
+                    ), history
+        
+        # This line should never be reached, but it's here to satisfy the type checker
+        raise Exception("Unexpected error in get_weak_hints")
 
     async def get_better_answer(self, question: str, weak_answer: str, hint: WeakHints, history: List[str] = []) -> Tuple[BetterAnswer, List[str]]:
         query = f"""
@@ -442,7 +457,6 @@ class MCTSr:
             answers_list.append(refined_answer)
             hints_list.append(hints)
 
-            # 改善点5: 終了条件の拡張
             if self.check_termination(refined_answer.final_answer, iteration):
                 break
 
@@ -452,26 +466,17 @@ class MCTSr:
         return hints_list, answers_list, self.to_explore, self.to_explore_reward, self.hints_bank, self.history_bank, self.hints_reward_imp_bank, self.fathers, self.childs, self.ucb_bank
 
     def check_termination(self, current_answer: str, iteration: int) -> bool:
-        # 正解チェック
         if check(self.ground_truth, current_answer):
             return True
 
-        # 早期停止
         if iteration > 1:
             current_reward = self.to_explore_reward[current_answer][-1]
             previous_reward = self.to_explore_reward[self.fathers[current_answer]][-1]
             if (current_reward - previous_reward) / abs(previous_reward) < self.early_stop_threshold:
                 return True
 
-        # 探索深度制限
         if len(self.fathers) > self.max_depth:
             return True
-
-        # 言語モデルのロジットに基づく終了条件
-        # 注: この部分は使用する言語モデルの仕様に応じて調整が必要です
-        # logits = self.get_logits(current_answer)
-        # if max(logits) > self.logits_threshold:
-        #     return True
 
         return False
 
@@ -505,24 +510,26 @@ async def process_example(example: Dict[str, Any]) -> Dict[str, Any]:
 
 # メイン実行
 async def main():
-    # データセットの読み込みと処理
-    # dataset = load_dataset(...)
-    # この部分は実際のデータセットに合わせて調整する必要があります
     dataset = [
         # {"question": "2 + 2 = ?", "answer": "4"},
         # {"question": "What is the capital of France?", "answer": "Paris"},
-        # ... 他の例を追加 ...
-        {"question": """
-            問題：100個の電球が一列に並んでいます。最初、すべての電球が消えています。
-            あなたは以下の操作を100回行います：
-            1回目：1の倍数番目のすべての電球のスイッチを切り替えます。
-            2回目：2の倍数番目のすべての電球のスイッチを切り替えます。
-            3回目：3の倍数番目のすべての電球のスイッチを切り替えます。
-            ...
-            100回目：100の倍数番目のすべての電球のスイッチを切り替えます。
-            
-            100回の操作が終わった後、何個の電球が点灯していますか？
-        """, "answer": "10"},
+        # {"question": "Is the Earth flat?", "answer": False},
+        # {"question": "Which of the following is a prime number? A) 4, B) 7, C) 9, D) 12", "answer": "B"},
+        # {"question": "What is the formula for the area of a circle?", "answer": "$πr^2$"},
+        {
+            "question": """
+                Problem: There are 100 light bulbs lined up in a row. Initially, all the bulbs are off.
+                You perform the following operation 100 times:
+                1st time: Toggle the switch of every bulb that is a multiple of 1.
+                2nd time: Toggle the switch of every bulb that is a multiple of 2.
+                3rd time: Toggle the switch of every bulb that is a multiple of 3.
+                ...
+                100th time: Toggle the switch of every bulb that is a multiple of 100.
+                
+                After 100 operations, how many bulbs are lit?
+            """,
+            "answer": "10"
+        }
     ]
     
     processed_data = []
@@ -530,7 +537,6 @@ async def main():
         result = await process_example(example)
         processed_data.append(result)
     
-    # 結果の保存（例：JSON形式で）
     import json
     with open('processed_data.json', 'w') as f:
         json.dump(processed_data, f, indent=4)
